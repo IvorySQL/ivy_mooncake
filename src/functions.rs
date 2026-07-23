@@ -31,15 +31,25 @@ fn create_table(dst: &str, src: &str, src_uri: Option<&str>, table_config: Optio
     let src_uri = src_uri.unwrap_or(&dst_uri).to_owned();
     create_mooncake_table(&dst, &dst_uri, &src, &src_uri);
     let table_config = table_config.unwrap_or("{}").to_owned();
-    block_on(moonlink_rpc::create_table(
+    // Bind the result before inspecting it so the moonlink stream guard is
+    // released first: panicking while the guard is alive poisons the mutex
+    // and breaks every later mooncake call in this backend.
+    let result = block_on(moonlink_rpc::create_table(
         &mut *get_stream(),
         DATABASE.clone(),
-        dst,
+        dst.clone(),
         src,
         src_uri,
         table_config,
-    ))
-    .expect("create_table failed");
+    ));
+    if let Err(err) = result {
+        // Moonlink rejected the table (e.g. a column type it cannot store in
+        // Iceberg). Drop the mirror table just created over the loopback so a
+        // failed call doesn't leave behind a mooncake table that moonlink has
+        // no knowledge of.
+        drop_mooncake_table(&dst, &dst_uri);
+        panic!("create_table failed: {err:?}");
+    }
 }
 
 #[pg_extern(sql = "
@@ -195,11 +205,28 @@ fn uri_encode(input: &str) -> String {
     result
 }
 
+/// IvorySQL: the loopback URI targets the PG-mode port, so the new session
+/// defaults to `ivorysql.compatible_mode = pg` even on an Oracle-mode
+/// cluster. Oracle types emitted by format_type (number, varchar2, clob)
+/// then fail to resolve in the CREATE TABLE. Propagate the calling
+/// session's mode so DDL built from Oracle-typed tables works.
+fn propagate_compatible_mode(client: &mut Client) {
+    let mode = Spi::get_one::<String>("SELECT current_setting('ivorysql.compatible_mode', true)");
+    if let Ok(Some(mode)) = mode {
+        if mode == "oracle" {
+            client
+                .simple_query("SET ivorysql.compatible_mode TO oracle")
+                .expect("error setting ivorysql.compatible_mode");
+        }
+    }
+}
+
 fn create_mooncake_table(dst: &str, dst_uri: &str, src: &str, src_uri: &str) {
     let tls_connector = TlsConnector::new().expect("error creating tls connector");
     let make_tls_connector = MakeTlsConnector::new(tls_connector);
     let mut client = Client::connect(src_uri, make_tls_connector.clone())
         .unwrap_or_else(|_| panic!("error connecting to server: {src_uri}"));
+    propagate_compatible_mode(&mut client);
 
     let get_columns_query = format!(
         "SELECT string_agg(
@@ -223,12 +250,27 @@ fn create_mooncake_table(dst: &str, dst_uri: &str, src: &str, src_uri: &str) {
     if dst_uri != src_uri {
         client = Client::connect(dst_uri, make_tls_connector)
             .unwrap_or_else(|_| panic!("error connecting to server: {dst_uri}"));
+        propagate_compatible_mode(&mut client);
     }
 
     let create_table_query = format!("CREATE TABLE {dst} ({columns}) USING mooncake");
     client
         .simple_query(&create_table_query)
         .unwrap_or_else(|_| panic!("error creating table: {dst}"));
+}
+
+/// Best-effort cleanup of a mirror table whose moonlink registration failed.
+/// Errors are swallowed: this runs on an error path already headed for panic,
+/// and the original moonlink error is the one worth reporting.
+fn drop_mooncake_table(dst: &str, dst_uri: &str) {
+    let Ok(tls_connector) = TlsConnector::new() else {
+        return;
+    };
+    let make_tls_connector = MakeTlsConnector::new(tls_connector);
+    let Ok(mut client) = Client::connect(dst_uri, make_tls_connector) else {
+        return;
+    };
+    let _ = client.simple_query(&format!("DROP TABLE IF EXISTS {dst}"));
 }
 
 /// Diagnostic helper for moonlink bgworker liveness.
